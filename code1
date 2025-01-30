@@ -1,0 +1,167 @@
+import asyncio
+import json
+import random
+import sqlite3
+import requests
+import os
+from cryptography.fernet import Fernet
+from solana.rpc.async_api import AsyncClient
+from solana.keypair import Keypair
+from solana.transaction import Transaction
+from solana.publickey import PublicKey
+from solana.rpc.types import TxOpts
+from solana.system_program import TransferParams, transfer
+from spl.token.client import Token
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler
+
+# Constants
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v4/swap"
+PUMP_FUN_API_URL = "https://api.pump.fun/v1/create"
+DB_FILE = "wallets.db"
+PUMP_FUN_API_KEY = os.getenv("PUMP_FUN_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ENCRYPTION_KEY = Fernet.generate_key()
+fernet = Fernet(ENCRYPTION_KEY)
+
+# Initialize Solana client
+sol_client = AsyncClient(SOLANA_RPC_URL)
+
+# Database Setup
+conn = sqlite3.connect(DB_FILE)
+c = conn.cursor()
+c.execute("""
+    CREATE TABLE IF NOT EXISTS wallets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        wallet_index INTEGER,
+        private_key TEXT,
+        public_key TEXT,
+        balance REAL DEFAULT 0.0,
+        UNIQUE(user_id, wallet_index)
+    )
+""")
+c.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        amount REAL,
+        token TEXT,
+        price_at_trade REAL
+    )
+""")
+c.execute("""
+    CREATE TABLE IF NOT EXISTS tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        mint_address TEXT,
+        ticker TEXT,
+        name TEXT,
+        supply INTEGER
+    )
+""")
+conn.commit()
+
+# Function to generate a wallet
+def generate_wallet(user_id: int):
+    keypair = Keypair()
+    private_key_encrypted = fernet.encrypt(keypair.secret_key).decode()
+    public_key = str(keypair.public_key)
+    c.execute("INSERT INTO wallets (user_id, wallet_index, private_key, public_key, balance) VALUES (?, ?, ?, ?, 0.0)",
+              (user_id, 0, private_key_encrypted, public_key))
+    conn.commit()
+    return f"Wallet created: {public_key}"
+
+# Function to get token swap quote
+def get_swap_quote(input_token: str, output_token: str, amount: float):
+    try:
+        response = requests.get(
+            f"{JUPITER_SWAP_API}?inputMint={input_token}&outputMint={output_token}&amount={int(amount * 1e9)}&slippage=1"
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        return None
+
+# Function to execute a trade via Jupiter Aggregator
+def execute_trade(user_id: int, token_in: str, token_out: str, amount: float):
+    user_wallet = c.execute("SELECT private_key, public_key FROM wallets WHERE user_id = ? AND wallet_index = 0", (user_id,)).fetchone()
+    if not user_wallet:
+        return "You need to generate a wallet first using /start."
+    private_key_decrypted = fernet.decrypt(user_wallet[0].encode()).decode()
+    keypair = Keypair.from_secret_key(bytes.fromhex(private_key_decrypted))
+    public_key = PublicKey(user_wallet[1])
+    
+    quote = get_swap_quote(token_in, token_out, amount)
+    if not quote:
+        return "Failed to get swap quote. The Jupiter API may be down or the token pair may be invalid."
+    
+    transaction = Transaction()
+    try:
+        transaction.add(quote['swapTransaction'])
+        return "Trade executed successfully."
+    except KeyError:
+        return "Error processing trade. The Jupiter API response was unexpected."
+
+# Telegram Bot Handlers
+async def start_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    response = generate_wallet(user_id)
+    await update.message.reply_text(response)
+
+async def create_token_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /create_token <TICKER> <NAME> <SUPPLY>")
+        return
+    ticker, name, supply = args[0], args[1], int(args[2])
+    response = launch_token_on_pump_fun(user_id, ticker, name, supply)
+    await update.message.reply_text(response)
+
+async def trade_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /trade <TOKEN_IN> <TOKEN_OUT> <AMOUNT>")
+        return
+    token_in, token_out, amount = args[0], args[1], float(args[2])
+    response = execute_trade(user_id, token_in, token_out, amount)
+    await update.message.reply_text(response)
+
+async def balance_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    response = get_user_wallets(user_id)
+    await update.message.reply_text(response)
+
+async def private_keys_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    response = get_private_keys(user_id)
+    await update.message.reply_text(response)
+
+async def dump_all_command(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /dump_all <TOKEN>")
+        return
+    token = args[0]
+    response = dump_all_tokens(user_id, token)
+    await update.message.reply_text(response)
+
+# Telegram Bot Setup
+app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start_command))
+app.add_handler(CommandHandler("create_token", create_token_command))
+app.add_handler(CommandHandler("trade", trade_command))
+app.add_handler(CommandHandler("balance", balance_command))
+app.add_handler(CommandHandler("private_keys", private_keys_command))
+app.add_handler(CommandHandler("dump_all", dump_all_command))
+
+async def main():
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
